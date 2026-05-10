@@ -8,9 +8,9 @@
 #include "autoconf.h" // CONFIG_USB_VENDOR_ID
 #include "board/misc.h" // console_sendf
 #include "board/pgm.h" // PROGMEM
-#include "board/usb_cdc_ep.h" // USB_CDC_EP_BULK_IN
+#include "board/usb_cdc_ep.h" // USB_CDC_EP_BULK_IN/OUT
 #include "byteorder.h" // cpu_to_le16
-#include "command.h" // output
+#include "command.h" // DECL_CONSTANT
 #include "generic/usbstd.h" // struct usb_device_descriptor
 #include "generic/usbstd_cdc.h" // struct usb_cdc_header_descriptor
 #include "sched.h" // sched_wake_task
@@ -90,6 +90,8 @@ console_sendf(const struct command_encoder *ce, va_list args)
 static struct task_wake usb_bulk_out_wake;
 static uint8_t receive_buf[128], receive_pos;
 
+DECL_CONSTANT("RECEIVE_WINDOW", sizeof(receive_buf) - USB_CDC_EP_BULK_OUT_SIZE);
+
 void
 usb_notify_bulk_out(void)
 {
@@ -101,30 +103,44 @@ usb_bulk_out_task(void)
 {
     if (!sched_check_wake(&usb_bulk_out_wake))
         return;
-    // Read data
-    uint_fast8_t rpos = receive_pos, pop_count;
-    if (rpos + USB_CDC_EP_BULK_OUT_SIZE <= sizeof(receive_buf)) {
-        int_fast8_t ret = usb_read_bulk_out(
-            &receive_buf[rpos], USB_CDC_EP_BULK_OUT_SIZE);
-        if (ret > 0) {
-            rpos += ret;
-            usb_notify_bulk_out();
+
+    uint_fast8_t rpos = receive_pos;
+    uint8_t need_wake = 0;
+    uint_fast8_t reads = 0, dispatches = 0;
+    for (;;) {
+        // Process buffered data before accepting another full USB packet.
+        uint_fast8_t pop_count = 0;
+        int_fast8_t ret = command_find_and_dispatch(
+            receive_buf, rpos, &pop_count);
+        if (ret) {
+            dispatches++;
+            uint_fast8_t needcopy = rpos - pop_count;
+            if (needcopy)
+                memmove(receive_buf, &receive_buf[pop_count], needcopy);
+            rpos = needcopy;
+            need_wake = 1;
+            if (dispatches >= 2)
+                break;
+            continue;
         }
-    } else {
-        usb_notify_bulk_out();
-    }
-    // Process a message block
-    int_fast8_t ret = command_find_and_dispatch(receive_buf, rpos, &pop_count);
-    if (ret) {
-        // Move buffer
-        uint_fast8_t needcopy = rpos - pop_count;
-        if (needcopy) {
-            memmove(receive_buf, &receive_buf[pop_count], needcopy);
-            usb_notify_bulk_out();
+
+        if (reads >= 2)
+            break;
+        if (rpos + USB_CDC_EP_BULK_OUT_SIZE > sizeof(receive_buf)) {
+            need_wake = 1;
+            break;
         }
-        rpos = needcopy;
+
+        ret = usb_read_bulk_out(&receive_buf[rpos], USB_CDC_EP_BULK_OUT_SIZE);
+        if (ret <= 0)
+            break;
+        rpos += ret;
+        reads++;
+        need_wake = 1;
     }
     receive_pos = rpos;
+    if (need_wake)
+        usb_notify_bulk_out();
 }
 DECL_TASK(usb_bulk_out_task);
 
