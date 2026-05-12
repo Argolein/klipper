@@ -39,11 +39,9 @@ usb_notify_bulk_in(void)
     sched_wake_task(&usb_bulk_in_wake);
 }
 
-void
-usb_bulk_in_task(void)
+static void
+usb_bulk_in_send(void)
 {
-    if (!sched_check_wake(&usb_bulk_in_wake))
-        return;
     uint_fast8_t tpos = transmit_pos, max_tpos = tpos;
     if (!tpos)
         return;
@@ -60,6 +58,14 @@ usb_bulk_in_task(void)
         usb_notify_bulk_in();
     }
     transmit_pos = needcopy;
+}
+
+void
+usb_bulk_in_task(void)
+{
+    if (!sched_check_wake(&usb_bulk_in_wake))
+        return;
+    usb_bulk_in_send();
 }
 DECL_TASK(usb_bulk_in_task);
 
@@ -106,22 +112,20 @@ usb_bulk_out_task(void)
 
     uint_fast8_t rpos = receive_pos;
     uint8_t need_wake = 0;
-    uint_fast8_t reads = 0, dispatches = 0;
+    uint_fast8_t reads = 0;
     for (;;) {
         // Process buffered data before accepting another full USB packet.
         uint_fast8_t pop_count = 0;
         int_fast8_t ret = command_find_and_dispatch(
             receive_buf, rpos, &pop_count);
         if (ret) {
-            dispatches++;
             uint_fast8_t needcopy = rpos - pop_count;
             if (needcopy)
                 memmove(receive_buf, &receive_buf[pop_count], needcopy);
             rpos = needcopy;
+            usb_bulk_in_send();
             need_wake = 1;
-            if (dispatches >= 2)
-                break;
-            continue;
+            break;
         }
 
         if (reads >= 2)

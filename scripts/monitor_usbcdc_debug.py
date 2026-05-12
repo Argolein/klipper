@@ -173,6 +173,11 @@ class RetransmitMonitor:
 def is_usbcdc_debug_response(response):
     return (
         "USB_CDC_DEBUG_BUILD=" in response
+        or "outstall " in response
+        or "epout " in response
+        or "epin " in response
+        or "atsamd_usb " in response
+        or "max_bk1rdy_to_trcpt1_us=" in response
         or "max_busy_us=" in response
         or "max_error_pop=" in response
         or "USB-CDC debug command" in response

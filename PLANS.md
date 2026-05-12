@@ -140,6 +140,37 @@ the print crashes with `MCU 'mcu' shutdown: Timer too close`.
   confirm whether `max_rpos`, `max_pop`, `error`, and `mcu_rt` improve
 - [x] Confirm `rxdrain-20260510` with a second successful reproduction print
 - [x] Prepare PR-clean production diff limited to `src/generic/usb_cdc.c`
+- [x] Capture usbmon and host retransmit logs for a Mini 5+ retransmit burst
+- [x] Correlate retransmitted host blocks with USB bus traffic
+- [x] Implement USB-CDC early-ACK fork test: send the ACK for a valid block
+  before dispatching the block's commands, and flush USB-IN immediately
+- [x] Revert USB-CDC early-ACK fork test after it reproduced rapid
+  `mcu_rt` growth
+- [x] Copy the reverted `src/generic/usb_cdc.c` to the Pi, rebuild, and flash
+  the Mini 5+ again so the bad early-ACK firmware is no longer active
+- [x] Add lower-level atsamd Bulk-IN on-demand snapshot counters in
+  `src/atsamd/usbserial.c`
+- [x] Update `QUERY_USBCDC_DEBUG` helper output for the atsamd snapshot format
+- [x] Copy atsamd snapshot build to Raspberry Pi, build, flash, and capture
+  `QUERY_USBCDC_DEBUG RESET=0` during the next `mcu_rt` rise
+- [x] Analyze atsamd Bulk-IN snapshot captured during `mcu_rt` growth
+- [x] Add second atsamd Bulk-IN snapshot focused on opportunistic `TRFAIL1`
+  sampling without enabling `TRFAIL1` interrupts
+- [x] Build/flash `atsamd-trfail-20260510` and capture retransmit-phase
+  snapshots
+- [x] Analyze `atsamd-trfail-20260510` retransmit-phase snapshots
+- [x] Add Bulk-OUT `STALL0` interrupt/snapshot instrumentation in
+  `src/atsamd/usbserial.c`
+- [x] Build/flash `atsamd-outstall-20260510` and test whether
+  `stall0_count` rises with `mcu_rt`
+- [x] Analyze first `atsamd-outstall-20260510` monitor output
+- [x] Analyze extended `atsamd-outstall-20260510` monitor output
+- [x] Add raw Bulk-OUT/Bulk-IN endpoint register snapshots and enable
+  Bulk-OUT `STALL1` instrumentation
+- [x] Build/flash `atsamd-epraw-20260510` and inspect `epout`/`epin` raw
+  endpoint state during `mcu_rt` rise
+- [x] Analyze first `atsamd-epraw-20260510` output
+- [x] Analyze same-run `atsamd-epraw-20260510` usbmon plus monitor capture
 
 ## Decisions
 - Treat PR #7142 as already present. It fixes the previous `PCKSIZE.SIZE`
@@ -154,6 +185,11 @@ the print crashes with `MCU 'mcu' shutdown: Timer too close`.
   leave instruction cache enabled.
 - Use the Raspberry Pi 4B Klipper host at `192.168.178.82`.
 - Use actual Pi SSH user `voron`.
+- Firmware tests on the Pi were built with `arm-none-eabi-gcc 12.2.1`
+  (`15:12.2.rel1-1`, 2022-12-05), host `gcc 12.2.0`, and GNU Make 4.3. The
+  Mac has a newer local `arm-none-eabi-gcc 15.2.1`, but that is not the
+  toolchain used for the tested Pi firmware builds unless explicitly copied or
+  built there.
 - CMCC data-cache disable alone does not fix the reproduced failure.
 - The CMCC data-cache test patch was reverted locally before adding USB-CDC
   instrumentation, so the next firmware is baseline cache behavior plus debug
@@ -238,6 +274,22 @@ the print crashes with `MCU 'mcu' shutdown: Timer too close`.
   shifts suspicion away from MCU scheduler/task latency and toward lower-level
   USB transfer completion, ACK response visibility/loss, or host USB transport
   behavior.
+- usbmon capture from 2026-05-10 confirms the host OUT transfers for the
+  retransmitted blocks complete quickly on the USB bus (roughly 95-524us), but
+  the matching ACK sequence becomes visible on USB-IN only after about
+  25.7-77.5ms for nearly all correlated retransmit blocks. This rules out
+  Linux userspace/TTY read latency as the primary cause for those samples and
+  points below Klipper host code: Mini 5+ USB device side, USB controller
+  scheduling, endpoint service timing, or the Pi/USB transport path.
+- The next fork test is USB-CDC early ACK. The ACK is now generated and pushed
+  to USB-IN immediately after a valid message block is parsed, before
+  `command_dispatch()` executes the block. This intentionally changes the
+  normal ordering for USB-CDC only: the host may receive credit before all
+  commands in the block have finished dispatching. The receive window remains
+  conservative so the host still cannot build a deep backlog.
+- Early ACK is rejected. Test print immediately reproduced continuous
+  `mcu_rt` growth (`9 -> 938` within about one minute), so the local source was
+  reverted to the prior receive-drain/fast-flush behavior without early ACK.
 - Because `max_rpos=127` with `RECEIVE_WINDOW=128`, the receive buffer did run
   essentially full during the failing workload. This revives the conservative
   receive-window hypothesis: even if 128 is the literal buffer size, it may be
@@ -305,11 +357,205 @@ the print crashes with `MCU 'mcu' shutdown: Timer too close`.
     `src/atsamd/usbserial.c`.
   - Left private untracked investigation helpers/documents in the working tree
     for local reference only; do not commit them.
+- Clean production diff later showed a short recovered retransmit burst:
+  - `pt=1769.001 mcu_rt=70 rtseq=104973 rto=0.025`
+  - `pt=1771.811 mcu_rt=192 rtseq=105344 rto=0.100`
+  - `pt=1780.785 mcu_rt=315 rtseq=106093 rto=0.025`
+  - Interpretation: the receive-side patch appears to mitigate the previous
+    runaway retransmit storm, but it is not a complete fix. The remaining
+    events are still consistent with occasional timeout-driven late ACKs.
+    Additional evidence is needed before committing this as final.
+- Added ACK-prioritization refinement to the clean production diff:
+  - After `usb_bulk_out_task()` successfully dispatches one buffered command
+    block, it now stops the current OUT task run and self-wakes if needed.
+  - Rationale: `command_find_and_dispatch()` queues an ACK after dispatch; by
+    returning sooner, the USB IN task can send that ACK before more OUT
+    draining happens in the same task run.
+  - Still keeps the conservative receive window and bounded read loop.
+- ACK-prioritization alone did not prevent escalation:
+  - `pt=1593.366 mcu_rt=6272 seq=120907/120907 rtseq=120905 rto=0.025`
+  - `pt=1612.238 mcu_rt=8071 seq=122603/122603 rtseq=122536 rto=0.025`
+  - The print then shut down with `Timer too close`.
+  - Interpretation: the remaining Mini 5+ USB issue can still starve motion
+    command delivery enough to hit the MCU timer deadline even though
+    `buffer_time` stayed near ~0.9-1.0s immediately before shutdown.
+- Added fork-specific host throttle in `klippy/chelper/serialqueue.c`:
+  - For transports advertising a small `RECEIVE_WINDOW` (`<= MESSAGE_MAX`),
+    limit host message blocks to 32 bytes instead of 64.
+  - This keeps the existing stop-and-wait behavior from `RECEIVE_WINDOW=64`
+    but increases ACK frequency and reduces how much `queue_step` traffic is
+    affected by any one late ACK.
+  - Large single commands are still allowed up to the normal 64-byte protocol
+    maximum to avoid deadlocking config or uncommon commands.
+- Added ACK-fast-flush in `src/generic/usb_cdc.c`:
+  - Factored the USB bulk IN send path into `usb_bulk_in_send()`.
+  - After `usb_bulk_out_task()` successfully dispatches a buffered command
+    block, it now immediately tries to send queued USB-CDC response data
+    (normally the ACK) before returning.
+  - If the USB IN endpoint is busy, the queued response remains pending and
+    the normal `usb_bulk_in_task()` wake path still handles it.
+  - Rationale: distinguish MCU ACK-generation/IN-handoff delay from deeper
+    USB host/device transport delay and reduce time between dispatch and ACK
+    endpoint handoff.
+- Re-enabled host-side retransmit debug only, leaving firmware USB debug off:
+  - Logs `serialqueue retransmit ...` with `cause`, `pending`, retransmitted
+    bytes, `receive_window`, active `msg_max`, RTO state, and first pending
+    message bytes.
+  - Purpose: verify whether ACK-fast-flush plus 32-byte blocks still produces
+    timeout retransmits, and whether retransmitted blocks are actually smaller
+    under the fork throttle.
+- `output.md` retransmit debug analysis:
+  - Captured retransmits are still `cause=timeout`, usually `pending=1`, with
+    `receive_window=64`.
+  - Retransmitted blocks are still mostly 59-64 bytes (`bytes=59..64`,
+    `first=59..64`) and the lines do not contain `msg_max=32`.
+  - Interpretation: this capture was not from the current host helper build
+    containing the `msg_max` debug field and 32-byte throttle. It shows the
+    previous behavior: one full-sized outstanding block timing out, not the new
+    small-block throttle behavior.
+- Updated `output.md` analysis after the current host helper was active:
+  - Retransmits are still `cause=timeout`, not NAK fast retransmits.
+  - `pending=1`, `receive_window=64`, and `msg_max=32` are confirmed.
+  - Retransmitted blocks are now small (`bytes=27..33`, `first=27..33`), so
+    the 32-byte host throttle is working.
+  - Some blocks still retransmit twice (`rto=0.025` then `rto=0.050`) before
+    recovery.
+  - Interpretation: the remaining issue is not host overfeeding the MCU and
+    not oversized message blocks. The host is effectively stop-and-wait on one
+    small block, but the ACK for that block is still not visible within the
+    25ms RTO. The next useful evidence is USB-level timing via usbmon.
 - Historical RepRapFirmware SD-card/printing hiccups on Duet 3 Mini/Mini 5+
   may be relevant as a class of timing/peripheral-latency issue, but not as
   evidence that USB and SD share the same external bus. In Klipper the board is
   not streaming G-code from the Duet SD card, so this is mainly useful as
   context for SAME54/Mini timing sensitivity.
+- The next atsamd measurement should stay read-only/observational: count
+  Bulk-IN Bank 1 busy returns, successful Bulk-IN armings, Bulk-IN `TRCPT1`
+  completions, and the maximum time from arming `BK1RDY` to the next `TRCPT1`.
+  Do not change USB interrupt service order until this snapshot is captured.
+- atsamd Bulk-IN snapshot during `mcu_rt` growth is negative for the
+  BK1RDY-to-TRCPT1 delay hypothesis:
+  - `mcu_rt` rose from `9` to `1789`.
+  - `bulk_in_armed` and `trcpt1_count` stayed exactly equal in every captured
+    snapshot (`162741/162741` through `187011/187011`).
+  - `max_bk1rdy_to_trcpt1_us` stayed flat at `151us`, far below the
+    25ms/50ms retransmit timeouts.
+  - `bulk_in_busy_returns` rose only slowly (`436 -> 499`) across roughly
+    24k additional Bulk-IN armings.
+  - Interpretation: the USB device sees Bulk-IN Bank 1 complete promptly; the
+    remaining ACK invisibility is not explained by BK1RDY remaining busy or
+    missing TRCPT1 completions.
+  - Notable open clue: snapshots consistently show `epintflag=8`, which maps
+    to Bulk-IN `TRFAIL1` in the SAME54 headers. Determine whether this is
+    normal/sticky for this controller or a meaningful failure signal before
+    changing endpoint service behavior.
+- Do not enable Bulk-IN `TRFAIL1` interrupts. On SAME54 USB-CDC Bulk-IN this
+  may fire for normal idle NAK/poll behavior and risks masking the timing bug.
+  Instead, sample and clear sticky `TRFAIL1` opportunistically at two existing
+  execution points:
+  - Bulk-IN handler entry.
+  - `usb_send_bulk_in()` busy branch when `BK1RDY` is already set.
+- Interpret `trfail1_seen_count` and `trfail1_seen_busy_count` as sticky
+  observations at sample points, not as exact hardware event rates.
+- For the next run, capture an idle baseline before printing: run
+  `QUERY_USBCDC_DEBUG RESET=1` three times around 30 seconds apart, then use
+  the retransmit monitor during the print. Compare `trfail1_seen_count`,
+  `trfail1_seen_busy_count`, `trfail1_while_armed`, and
+  `max_bk1rdy_to_trcpt1_had_trfail1` against that baseline.
+- `atsamd-trfail-20260510` retransmit-phase result is negative for the
+  TRFAIL1-during-armed-transfer hypothesis:
+  - During `mcu_rt` growth from `9` to at least `4616`,
+    `bulk_in_armed`, `bulk_in_handler_count`, and `trcpt1_count` stayed equal
+    at every snapshot.
+  - `max_bk1rdy_to_trcpt1_us` stayed at `149us`.
+  - `max_bk1rdy_to_trcpt1_had_trfail1=0`, `trfail1_while_armed=0`,
+    `cur_trfail1=0`, and `active=0` in every retransmit-phase snapshot.
+  - `trfail1_seen_count` tracks nearly every Bulk-IN handler sample, which is
+    consistent with normal/sticky idle NAK observation.
+  - `trfail1_seen_busy_count` rises slowly but never marks the current or max
+    armed transfer as having seen TRFAIL1 while `BK1RDY` remained set.
+  - Interpretation: TRFAIL1 is most likely expected idle/sticky noise in this
+    workload, not the cause of delayed ACK visibility. The remaining issue is
+    outside the measured atsamd Bulk-IN bank ready/completion/error flag path.
+- usbmon correlation changed the leading hypothesis: the original Bulk-OUT
+  transfers for retransmitted blocks appear to complete with status `-32`
+  (`-EPIPE`), which means the device sent a USB STALL handshake. That is a
+  stronger explanation than late ACK generation: the MCU never accepted the
+  original OUT block, so the host waits for RTO and retransmits.
+- Next measurement is Bulk-OUT `STALL0`, not more Bulk-IN diagnostics. Enable
+  only `USB_DEVICE_EPINTENSET_STALL0` on `EP_BULKOUT`; do not enable `STALL1`
+  unless `STALL0` fails to correlate. In the ISR, only count the event, capture
+  the first-stall snapshot, clear the interrupt flag, and leave endpoint state
+  untouched.
+- First `atsamd-outstall-20260510` monitor output is not enough to confirm the
+  usbmon `-EPIPE` interpretation from the MCU side:
+  - During `mcu_rt` growth from `9` to `459`, every snapshot reported
+    `outstall stall0_count=0 first_valid=0`.
+  - This conflicts with the prior usbmon interpretation if the same failure
+    mode was active, because a Bulk-OUT STALL0 interrupt should have produced
+    a nonzero count.
+  - Possible explanations: this run did not include a usbmon-confirmed
+    `-EPIPE`, the SAME54 condition that Linux reports as `-EPIPE` does not set
+    `EPINTFLAG.STALL0`, the relevant interrupt is not `STALL0`, or the current
+    instrumentation is not sampling the right endpoint/bank condition.
+  - Do not conclude from this output alone that the usbmon `-EPIPE` finding was
+    wrong. Next evidence should be from the same run: usbmon plus
+    `outstall_monitor.log`, or broaden the instrumentation to include `STALL1`
+    and raw Bulk-OUT endpoint status snapshots on query.
+- Extended `atsamd-outstall-20260510` monitor output repeated the same negative
+  MCU-side result over a larger retransmit rise:
+  - `mcu_rt` rose from `459` to `1257`.
+  - `outstall stall0_count=0 first_valid=0` in every snapshot.
+  - Therefore, this firmware did not observe a Bulk-OUT `STALL0` interrupt
+    during the monitored retransmit rise. If a same-run usbmon trace still
+    shows `C Bo -32`, the device-side signal is not `EPINTFLAG.STALL0` as
+    currently instrumented.
+- Next raw endpoint snapshot broadens the observation without changing endpoint
+  state:
+  - Build marker: `USB_CDC_DEBUG_BUILD=atsamd-epraw-20260510`.
+  - Bulk-OUT now enables both `STALL0` and `STALL1` interrupt bits, but the
+    ISR still only counts/snapshots/clears the interrupt flag.
+  - `QUERY_USBCDC_DEBUG` now emits `epout ...` and `epin ...` raw register
+    lines containing `EPCFG`, `EPINTENSET`, `EPINTFLAG`, `EPSTATUS`, and both
+    descriptor-bank `PCKSIZE` values. This verifies whether `STALL0`/`STALL1`
+    are actually enabled, whether sticky flags are present at query time, and
+    whether bank descriptor state looks abnormal during retransmit growth.
+- First `atsamd-epraw-20260510` output verifies the instrumentation and is
+  negative for MCU-observed Bulk-OUT STALL flags during the sampled rise:
+  - `mcu_rt` rose from `9` to `102`.
+  - `epout epintenset=99` (`0x63`) confirms `TRCPT0`, `TRCPT1`, `STALL0`,
+    and `STALL1` interrupts are enabled on Bulk-OUT.
+  - `outstall stall0_count=0 stall1_count=0 first_valid=0`.
+  - `epout epintflag=0 epstatus=0`, so no sticky `STALL0/STALL1`, no
+    `STALLRQ0/1`, no `BK0RDY/BK1RDY`, and no abnormal status bits were present
+    at query time.
+  - Bulk-OUT Bank0 `PCKSIZE` values decoded as size class 3 (64-byte endpoint)
+    with current byte counts `14` and `7`; Multi Packet Size was zero.
+  - Interpretation: this confirms the firmware instrumentation is enabled, but
+    it still does not observe a SAME54 Bulk-OUT STALL condition during the
+    sampled retransmit rise. Same-run usbmon is now required to determine
+    whether Linux still reports `C Bo -32` in this build/run.
+- Same-run `atsamd-epraw-20260510` usbmon plus monitor capture corrects the
+  `C Bo -32` interpretation:
+  - The current usbmon trace contains exactly three `C Bo:1:057:2 -32`
+    completions.
+  - Each `-32` is immediately preceded by `S Co:1:002:0 s 23 08 ...`, a hub
+    class control transfer to USB device `1:002`, not to the Mini 5+
+    application device `1:057`.
+  - `s 23 08` is the hub Transaction Translator clear-buffer path for a
+    full-speed device behind a high-speed hub. Therefore the host error path is
+    hub/TT related, not a directly observed SAME54 endpoint `STALL0/STALL1`
+    interrupt/status condition.
+  - In the same time window, the MCU monitor still reports
+    `stall0_count=0 stall1_count=0 first_valid=0`, with `epout epintflag=0`
+    and `epout epstatus=0` in the available snapshots.
+  - The retransmit timing remains the same: the failed OUT URB completes with
+    `-32` roughly 431-486us after submit, and Klipper resubmits the same block
+    about 25.2-25.7ms later.
+  - New leading direction: verify and simplify the physical USB topology. Test
+    the Mini 5+ directly on a Pi root port or a different high-quality hub/cable
+    path, and capture `lsusb -t` to see whether the Mini 5+ and EBB devices are
+    sharing the same Transaction Translator.
 
 ## Findings So Far
 
@@ -862,51 +1108,107 @@ Interpretation: patched firmware was successfully written and verified.
 - Agent: Codex
 - Date: 2026-05-10
 - Completed this session:
-  - Read `PLANS.md` and `dual-bank.md`.
-  - Added Pre-flight `in_max_busy_us` tracking to `src/generic/usb_cdc.c`.
-  - Updated `klippy/extras/usbcdc_debug.py` to print `max_busy_us`.
-  - Added `scripts/monitor_usbcdc_debug.py`, which watches
-    `mcu: bytes_retransmit` in `klippy.log` and sends
-    `QUERY_USBCDC_DEBUG RESET=0` through Klipper's webhooks socket when it
-    changes.
-  - Updated the monitor script to try the modern Moonraker/Klipper socket
-    path `~/printer_data/comms/klippy.sock` before the older
-    `/tmp/klippy_uds` path.
-  - Classified the Pre-flight snapshot from the Pi as negative:
-    `max_busy_us=177`, far below the `<5000us` stop threshold.
-  - Implemented the smaller USB-CDC receive-side candidate in
-    `src/generic/usb_cdc.c`: conservative 64-byte receive window,
-    process-before-read OUT task ordering, bounded two-read/two-dispatch loop,
-    and parse-error/max-error-pop counters.
-  - Updated `klippy/extras/usbcdc_debug.py` for the new
-    `usbcdc_debug_dispatch error=... max_error_pop=...` fields.
-  - Observed a full reproduction print complete with `mcu_rt=9`,
-    `max_rpos=64`, `max_pop=64`, `error=0`, and `max_error_pop=0`.
-  - Observed a second full reproduction print complete with the same clean
-    signature: `mcu_rt=9`, `max_rpos=64`, `max_pop=64`, `error=0`, and
-    `max_error_pop=0`.
-  - Reduced the production diff to `src/generic/usb_cdc.c` only.
-  - Ran `python3 -m py_compile klippy/extras/usbcdc_debug.py`.
-  - Ran `python3 -m py_compile scripts/monitor_usbcdc_debug.py`.
-  - Ran `git diff --check -- src/generic/usb_cdc.c klippy/extras/usbcdc_debug.py`.
-  - Ran `git diff --check -- scripts/monitor_usbcdc_debug.py`.
+  - Read the current `PLANS.md` handoff and reviewed
+    `src/atsamd/usbserial.c`, `src/generic/usb_cdc.c`,
+    `klippy/extras/usbcdc_debug.py`, and `scripts/monitor_usbcdc_debug.py`.
+  - Added on-demand lower-level atsamd Bulk-IN snapshot counters in
+    `src/atsamd/usbserial.c`:
+    `bulk_in_busy_returns`, `bulk_in_armed`, `trcpt1_count`,
+    `max_bk1rdy_to_trcpt1_us`, active state, endpoint status, endpoint
+    interrupt flags, and Bulk-IN descriptor `PCKSIZE`.
+  - Added `USB_CDC_DEBUG_BUILD=atsamd-intrcpt-20260510`.
+  - Reused the existing MCU command name `get_usbcdc_debug reset=%c`, now
+    returning `usbcdc_debug_atsamd ...` for this atsamd-only measurement.
+  - Updated `klippy/extras/usbcdc_debug.py` so `QUERY_USBCDC_DEBUG RESET=0`
+    can display either the new atsamd snapshot or the older generic
+    `usbcdc_debug_dispatch` snapshot.
+  - Updated `scripts/monitor_usbcdc_debug.py` so the automatic retransmit
+    monitor prints `atsamd_usb ...` responses.
+  - Ran Python bytecode checks for `klippy/extras/usbcdc_debug.py` and
+    `scripts/monitor_usbcdc_debug.py`.
+  - Ran `git diff --check` for `src/atsamd/usbserial.c`,
+    `klippy/extras/usbcdc_debug.py`, and `scripts/monitor_usbcdc_debug.py`.
+  - Reviewed `output.md` captured from the Pi during a retransmit escalation.
+  - Classified the atsamd Bulk-IN snapshot as negative for the
+    BK1RDY-to-TRCPT1-delay hypothesis: `bulk_in_armed == trcpt1_count`
+    throughout, `max_bk1rdy_to_trcpt1_us=151`, and `bulk_in_busy_returns`
+    rose only slowly while `mcu_rt` climbed.
+  - Added the second atsamd snapshot version:
+    `USB_CDC_DEBUG_BUILD=atsamd-trfail-20260510`.
+  - Added `bulk_in_handler_count`, `trfail1_seen_count`,
+    `trfail1_seen_busy_count`, `trfail1_while_armed`, `cur_trfail1`, and
+    `max_bk1rdy_to_trcpt1_had_trfail1`.
+  - Sampled and cleared sticky Bulk-IN `TRFAIL1` at Bulk-IN handler entry and
+    in the Bulk-IN busy branch only; did not enable `TRFAIL1` interrupts.
+  - Updated `klippy/extras/usbcdc_debug.py` for the expanded
+    `usbcdc_debug_atsamd` response.
+  - Ran Python bytecode checks and `git diff --check` for the changed debug
+    files.
+  - Reviewed the new `output.md` from the Pi with
+    `USB_CDC_DEBUG_BUILD=atsamd-trfail-20260510`.
+  - Classified the TRFAIL1-focused measurement as negative: `trfail1_while_armed`
+    and `max_bk1rdy_to_trcpt1_had_trfail1` stayed zero while `mcu_rt` rose.
+  - Added `USB_CDC_DEBUG_BUILD=atsamd-outstall-20260510`.
+  - Enabled Bulk-OUT `STALL0` interrupt instrumentation only.
+  - Added `usbcdc_debug_outstall` response with `stall0_count` and the first
+    STALL snapshot: `first_epstatus`, `first_epintflag`, `first_epcfg`, and
+    Bulk-OUT Bank0 `first_pcksize`.
+  - Updated `klippy/extras/usbcdc_debug.py` and
+    `scripts/monitor_usbcdc_debug.py` so `QUERY_USBCDC_DEBUG` prints the
+    `outstall ...` line.
+  - Ran Python bytecode checks and `git diff --check` for the changed debug
+    files.
+  - Reviewed `output2.md` from the first `atsamd-outstall-20260510` test.
+    It showed `stall0_count=0` while `mcu_rt` rose from `9` to `459`.
+  - Reviewed `output3.md`, which extended the same result:
+    `stall0_count=0` while `mcu_rt` rose from `459` to `1257`.
+  - Added `USB_CDC_DEBUG_BUILD=atsamd-epraw-20260510`.
+  - Added Bulk-OUT `STALL1` enable/counting alongside `STALL0`.
+  - Added raw endpoint responses:
+    - `usbcdc_debug_epout epcfg=... epintenset=... epintflag=...
+      epstatus=... pck0=... pck1=...`
+    - `usbcdc_debug_epin epcfg=... epintenset=... epintflag=...
+      epstatus=... pck0=... pck1=...`
+  - Updated `klippy/extras/usbcdc_debug.py` and
+    `scripts/monitor_usbcdc_debug.py` for the new raw endpoint lines.
+  - Ran Python bytecode checks and `git diff --check` for the changed debug
+    files.
+  - Reviewed `output4.md`; `epout epintenset=99` confirmed Bulk-OUT
+    `STALL0|STALL1` instrumentation was enabled, but `stall0_count=0`,
+    `stall1_count=0`, `epout epintflag=0`, and `epout epstatus=0` during
+    `mcu_rt` growth.
+  - Reviewed same-run `usbmon_epraw_run.txt.gz`,
+    `usbmon_epraw_epipe.txt.gz`, and `epraw_monitor.log.gz`.
+  - Found exactly three current `C Bo:1:057:2 -32` completions, each
+    immediately preceded by `S Co:1:002:0 s 23 08 ...` to the upstream USB hub,
+    while the MCU-side monitor still reported `stall0_count=0` and
+    `stall1_count=0`.
+  - Reclassified the current `-32` evidence from "direct device endpoint STALL"
+    to a hub Transaction Translator clear-buffer/error path for a full-speed
+    device behind a high-speed hub.
 - Stopped at:
-  - Production diff is cleanly limited to `src/generic/usb_cdc.c`. Private
-    untracked investigation files remain in the working tree and should not be
-    committed.
+  - Raw endpoint instrumentation is active and did not observe MCU-side
+    Bulk-OUT STALL flags, while same-run usbmon shows hub/TT control transfers
+    immediately before each current `C Bo -32`.
 - Next step:
-  - Build/flash the clean production diff on the Pi once to confirm it still
-    connects and prints without the debug instrumentation. Then prepare commit
-    message/PR text.
+  - Capture the Pi USB topology with `lsusb -t` and test a physical topology
+    change: connect the Mini 5+ directly to a Pi root port, or move it to a
+    different high-quality hub/cable path, then repeat the same print/monitor
+    check to see whether hub/TT `s 23 08` plus `C Bo -32` disappears.
 - Open blockers:
-  - Need one confirmation print with the clean production diff before commit/PR.
+  - Need USB topology details and one direct-port/different-hub A/B test to
+    determine whether the remaining failure is caused by the current hub/TT
+    path rather than the SAME54 USB device-layer code.
 - Decisions made this session:
-  - Do not start the dual-bank implementation from `dual-bank.md`; the
-    Pre-flight measurement was negative (`max_busy_us=177`).
-  - Test receive-side flow-control/drainage before revisiting lower-level USB
-    endpoint architecture.
-  - Two clean reproduction prints are enough to proceed to a clean production
-    patch for review.
+  - Instrument first and keep the next patch observational only. Do not change
+    USB interrupt service order until the Bulk-IN BK1RDY-to-TRCPT1 snapshot is
+    captured.
+  - Include `bulk_in_armed` as a denominator even though the requested minimal
+    counters were `bulk_in_busy_returns` and `trcpt1_count`; otherwise
+    `trcpt1_count` is hard to interpret.
+  - Treat current same-run `C Bo -32` as hub/Transaction-Translator related
+    until topology testing proves otherwise; it does not correspond to the
+    SAME54 `STALL0/STALL1` instrumentation in this build.
 
 ## Notes
 - `PLANS-entwurf.md` remains as the original investigation draft.

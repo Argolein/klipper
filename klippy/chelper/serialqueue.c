@@ -88,6 +88,8 @@ struct serialqueue {
     struct list_head fast_readers;
     // Debugging
     struct list_head old_sent;
+    uint64_t debug_nak_seq;
+    int debug_nak_len;
     // Stats
     uint32_t bytes_write, bytes_read, bytes_retransmit, bytes_invalid;
 };
@@ -107,6 +109,7 @@ struct serialqueue {
 #define MIN_RTO 0.025
 #define MAX_RTO 5.000
 #define MAX_PENDING_BLOCKS 12
+#define SMALL_RECEIVE_WINDOW_MESSAGE_MAX 32
 #define MIN_REQTIME_DELTA 0.100
 #define MIN_BACKGROUND_DELTA 0.005
 #define IDLE_QUERY_TIME 1.0
@@ -290,9 +293,12 @@ handle_message(struct serialqueue *sq, double eventtime, int len)
         // Ack/nak message
         if (sq->last_ack_seq < rseq)
             sq->last_ack_seq = rseq;
-        else if (rseq > sq->ignore_nak_seq && !list_empty(&sq->sent_queue))
+        else if (rseq > sq->ignore_nak_seq && !list_empty(&sq->sent_queue)) {
             // Duplicate Ack is a Nak - do fast retransmit
+            sq->debug_nak_seq = rseq;
+            sq->debug_nak_len = len;
             pollreactor_update_timer(sq->pr, SQPT_RETRANSMIT, PR_NOW);
+        }
     } else {
         // Data message - add to receive queue
         struct queue_message *qm = message_fill(sq->input_buf, len);
@@ -384,6 +390,14 @@ kick_event(struct serialqueue *sq, double eventtime)
     pollreactor_update_timer(sq->pr, SQPT_COMMAND, PR_NOW);
 }
 
+static int
+get_message_max(struct serialqueue *sq)
+{
+    if (sq->receive_window && sq->receive_window <= MESSAGE_MAX)
+        return SMALL_RECEIVE_WINDOW_MESSAGE_MAX;
+    return MESSAGE_MAX;
+}
+
 // OS write of data to be sent to the mcu
 static void
 do_write(struct serialqueue *sq, void *buf, int buflen)
@@ -431,22 +445,50 @@ retransmit_event(struct serialqueue *sq, double eventtime)
 
     pthread_mutex_lock(&sq->lock);
 
+    int retransmit_due_to_nak = (
+        pollreactor_get_timer(sq->pr, SQPT_RETRANSMIT) == PR_NOW);
+
     // Retransmit all pending messages
     uint8_t buf[MESSAGE_MAX * MAX_PENDING_BLOCKS + 1];
-    int buflen = 0, first_buflen = 0;
+    int buflen = 0, first_buflen = 0, sent_count = 0;
+    char first_msg_hex[3 * MESSAGE_MAX + 1];
+    first_msg_hex[0] = '\0';
     buf[buflen++] = MESSAGE_SYNC;
     struct queue_message *qm;
     list_for_each_entry(qm, &sq->sent_queue, node) {
         memcpy(&buf[buflen], qm->msg, qm->len);
         buflen += qm->len;
-        if (!first_buflen)
+        sent_count++;
+        if (!first_buflen) {
             first_buflen = qm->len + 1;
+            int pos = 0;
+            for (int i = 0; i < qm->len; i++)
+                pos += snprintf(&first_msg_hex[pos],
+                                sizeof(first_msg_hex) - pos,
+                                "%02x%s", qm->msg[i],
+                                i + 1 < qm->len ? ":" : "");
+        }
     }
+    errorf("serialqueue retransmit name=%s cause=%s bytes=%d pending=%d"
+           " first=%d send_seq=%llu receive_seq=%llu retransmit_seq=%llu"
+           " last_ack_seq=%llu ignore_nak_seq=%llu nak_seq=%llu nak_len=%d"
+           " need_ack_bytes=%d last_ack_bytes=%d receive_window=%d"
+           " msg_max=%d srtt=%.3f rto=%.3f first_msg=%s",
+           sq->name, retransmit_due_to_nak ? "nak" : "timeout",
+           buflen, sent_count, first_buflen,
+           (unsigned long long)sq->send_seq,
+           (unsigned long long)sq->receive_seq,
+           (unsigned long long)sq->retransmit_seq,
+           (unsigned long long)sq->last_ack_seq,
+           (unsigned long long)sq->ignore_nak_seq,
+           (unsigned long long)sq->debug_nak_seq, sq->debug_nak_len,
+           sq->need_ack_bytes, sq->last_ack_bytes, sq->receive_window,
+           get_message_max(sq), sq->srtt, sq->rto, first_msg_hex);
     do_write(sq, buf, buflen);
     sq->bytes_retransmit += buflen;
 
     // Update rto
-    if (pollreactor_get_timer(sq->pr, SQPT_RETRANSMIT) == PR_NOW) {
+    if (retransmit_due_to_nak) {
         // Retransmit due to nak
         sq->ignore_nak_seq = sq->receive_seq;
         if (sq->receive_seq < sq->retransmit_seq)
@@ -474,6 +516,7 @@ build_and_send_command(struct serialqueue *sq, uint8_t *buf, int pending
                        , double eventtime)
 {
     int len = MESSAGE_HEADER_SIZE;
+    int max_len = get_message_max(sq) - MESSAGE_TRAILER_SIZE;
     while (sq->ready_bytes) {
         // Find highest priority message (message with lowest req_clock)
         uint64_t min_clock = MAX_CLOCK;
@@ -489,13 +532,21 @@ build_and_send_command(struct serialqueue *sq, uint8_t *buf, int pending
             }
         }
         // Append message to outgoing command
-        if (len + qm->len > MESSAGE_MAX - MESSAGE_TRAILER_SIZE)
+        int next_len = len + qm->len;
+        int force_single = 0;
+        if (next_len > max_len) {
+            if (len != MESSAGE_HEADER_SIZE
+                || next_len > MESSAGE_MAX - MESSAGE_TRAILER_SIZE)
+                break;
+            force_single = 1;
+        }
+        if (next_len > MESSAGE_MAX - MESSAGE_TRAILER_SIZE)
             break;
         list_del(&qm->node);
         if (list_empty(&cq->ready.msg_queue))
             list_del(&cq->ready.node);
         memcpy(&buf[len], qm->msg, qm->len);
-        len += qm->len;
+        len = next_len;
         sq->ready_bytes -= qm->len;
         if (qm->notify_id) {
             // Message requires notification - add to notify list
@@ -504,6 +555,8 @@ build_and_send_command(struct serialqueue *sq, uint8_t *buf, int pending
         } else {
             message_free(qm);
         }
+        if (force_single)
+            break;
     }
 
     // Fill header / trailer
@@ -614,7 +667,7 @@ check_send_command(struct serialqueue *sq, int pending, double eventtime)
     }
 
     // Check if a block is fully ready to send
-    if (sq->ready_bytes >= MESSAGE_PAYLOAD_MAX)
+    if (sq->ready_bytes >= get_message_max(sq) - MESSAGE_MIN)
         return PR_NOW;
     if (! sq->ce.est_freq) {
         // Clock unknown during initial startup - recheck on each add
